@@ -75,8 +75,28 @@ jobs:
                 pull_number: parseInt(depPrNumber)
               });
 
-              const isMergedToMain =
-                depPR.data.merged && depPR.data.base.ref === 'main';
+              let isMergedToMain = false;
+
+              if (depPR.data.merged && depPR.data.merge_commit_sha) {
+                try {
+                  const comparison = await github.rest.repos.compareCommitsWithBasehead({
+                    owner: depOwner,
+                    repo: depRepo,
+                    basehead: `main...${depPR.data.merge_commit_sha}`
+                  });
+                  
+                  // Se o status for "behind" ou "identical", significa que
+                  // a branch main contém o commit do PR (o commit está "atrás" ou é "idêntico" ao head da main)
+                  // OBSERVAÇÃO CORRIGIDA: a basehead na documentação da API é "base...head"
+                  // Então "main" = base, "merge_commit_sha" = head
+                  // Se o commit está contido na main, o *head* (merge_commit_sha) estará "behind" a *base* (main)
+                  // Ou o commit é exatamente o mesmo da main ("identical")
+                  isMergedToMain = ['behind', 'identical'].includes(comparison.data.status);
+                } catch (e) {
+                  // Se o commit não for encontrado, a API retorna erro
+                  isMergedToMain = false;
+                }
+              }
 
               if (!isMergedToMain) {
                 unmet.push({
