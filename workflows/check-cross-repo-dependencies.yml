@@ -1,0 +1,111 @@
+name: Check cross-repo dependencies
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check dependencies
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CROSS_REPO_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = context.payload.pull_request.number;
+
+            // 1. Busca commits da developer que ainda não estão na main
+            const comparison = await github.rest.repos.compareCommitsWithBasehead({
+              owner,
+              repo,
+              basehead: `main...developer`
+            });
+
+            const commitShas = comparison.data.commits.map(c => c.sha);
+
+            // 2. Acha todos os PRs mergeados na developer que geraram esses commits
+            const mergedPRs = await github.rest.pulls.list({
+              owner,
+              repo,
+              state: 'closed',
+              base: 'developer',
+              per_page: 50
+            });
+
+            const relevantPRs = mergedPRs.data.filter(pr =>
+              pr.merge_commit_sha && commitShas.includes(pr.merge_commit_sha)
+            );
+
+            // 3. Coleta todos os comments e varre por depends-on:
+            const dependsOnRegex = /depends-on:\s*(https:\/\/github\.com\/[^\s]+\/pull\/\d+)/gi;
+            const dependencies = [];
+
+            for (const pr of relevantPRs) {
+              const comments = await github.rest.issues.listComments({
+                owner,
+                repo,
+                issue_number: pr.number
+              });
+
+              for (const comment of comments.data) {
+                let match;
+                while ((match = dependsOnRegex.exec(comment.body)) !== null) {
+                  dependencies.push({ url: match[1], foundInPR: pr.number });
+                }
+              }
+            }
+
+            if (dependencies.length === 0) return; // Nenhuma dependência declarada
+
+            // 4. Checa se cada dependência foi merged na main
+            const unmet = [];
+
+            for (const dep of dependencies) {
+              const urlMatch = dep.url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+              if (!urlMatch) continue;
+
+              const [, depOwner, depRepo, depPrNumber] = urlMatch;
+
+              const depPR = await github.rest.pulls.get({
+                owner: depOwner,
+                repo: depRepo,
+                pull_number: parseInt(depPrNumber)
+              });
+
+              const isMergedToMain =
+                depPR.data.merged && depPR.data.base.ref === 'main';
+
+              if (!isMergedToMain) {
+                unmet.push({
+                  url: dep.url,
+                  foundInPR: dep.foundInPR,
+                  status: depPR.data.merged ? `merged na branch \`${depPR.data.base.ref}\`` : '⏳ ainda não merged'
+                });
+              }
+            }
+
+            // 5. Comenta no PR se houver dependências não atendidas
+            if (unmet.length === 0) return;
+
+            const lines = unmet.map(d =>
+              `- ${d.url} (declarada no PR #${d.foundInPR}) — ${d.status}`
+            );
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: prNumber,
+              body: `## ⚠️ Dependências não publicadas na \`main\`
+
+            Este PR contém commits que dependem de PRs externos ainda não disponíveis em produção:
+
+            ${lines.join('\n')}
+
+            > Resolva as dependências acima antes de fazer o merge.`
+            });
+
+            // Força falha no check para bloquear merge (opcional)
+            core.setFailed(`${unmet.length} dependência(s) pendente(s).`);
